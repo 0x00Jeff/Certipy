@@ -2093,6 +2093,21 @@ class Find:
 
         return (vulnerabilities, remarks, enrollable_principals, acl_principals)
 
+    @staticmethod
+    def _denied_rights_union(security: Any, user_sids: Set[str]) -> int:
+        """
+        Union the denied rights of every ACE whose SID the caller holds.
+
+        Windows evaluates access against the whole token, so an explicit Deny on
+        any SID the user has (their own or a group) revokes that right even when
+        another SID is Allowed it. Callers subtract this from the allowed rights.
+        """
+        denied = 0
+        for sid, rights in security.aces.items():
+            if sid in user_sids:
+                denied |= int(rights.get("denied_rights", 0))
+        return denied
+
     def template_has_vulnerable_acl(
         self, template: LDAPEntry
     ) -> Tuple[bool, List[str]]:
@@ -2113,13 +2128,19 @@ class Find:
         vulnerable_acl_sids = []
         has_vulnerable_acl = False
 
+        # Deny wins token-wide: union the denied rights across every SID the
+        # caller holds, then strip them from each SID's allowed rights before
+        # checking. This cancels an Allow granted to one of the user's groups
+        # when an explicit Deny targets the user (or another of their SIDs).
+        denied_union = self._denied_rights_union(security, user_sids)
+
         # Check ACEs for vulnerable permissions
         for sid, rights in security.aces.items():
             # Skip if not related to current user
             if sid not in user_sids:
                 continue
 
-            ad_rights = rights["rights"]
+            ad_rights = type(rights["rights"])(int(rights["rights"]) & ~denied_union)
             ad_extended_rights = rights["extended_rights"]
 
             # Check for dangerous permissions
@@ -2329,13 +2350,16 @@ class Find:
             self.target.username, self.sid, self.dn
         )
 
+        # Deny wins token-wide (see template_has_vulnerable_acl)
+        denied_union = self._denied_rights_union(security, user_sids)
+
         # Check ACEs for vulnerable permissions
         for sid, rights in security.aces.items():
             # Skip if not related to current user
             if sid not in user_sids:
                 continue
 
-            ad_rights = rights["rights"]
+            ad_rights = type(rights["rights"])(int(rights["rights"]) & ~denied_union)
 
             # Check for dangerous CA permissions
             dangerous_rights = [
@@ -2441,13 +2465,16 @@ class Find:
         vulnerable_acl_sids = []
         has_vulnerable_acl = False
 
+        # Deny wins token-wide (see template_has_vulnerable_acl)
+        denied_union = self._denied_rights_union(security, user_sids)
+
         # Check ACEs for vulnerable permissions
         for sid, rights in security.aces.items():
             # Skip if not related to current user
             if sid not in user_sids:
                 continue
 
-            ad_rights = rights["rights"]
+            ad_rights = type(rights["rights"])(int(rights["rights"]) & ~denied_union)
 
             # Check for dangerous OID permissions
             dangerous_rights = [

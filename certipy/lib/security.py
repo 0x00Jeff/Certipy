@@ -79,8 +79,6 @@ class ActiveDirectorySecurity(SecurityDescriptorParser):
         """
         aces = self.sd["Dacl"]["Data"]
 
-        # TODO: Handle DENIED ACEs
-
         for ace in aces:
             sid = format_sid(ace["Ace"]["Sid"].getData())
 
@@ -88,6 +86,8 @@ class ActiveDirectorySecurity(SecurityDescriptorParser):
             if sid not in self.aces:
                 self.aces[sid] = {
                     "rights": self.RIGHTS_TYPE(0),
+                    # Denied rights are kept per SID so deny can also be applied
+                    "denied_rights": self.RIGHTS_TYPE(0),
                     "extended_rights": [],
                     "inherited": bool(ace["AceFlags"] & INHERITED_ACE),
                     # Tracks if a standard ACCESS_ALLOWED_ACE grants control access (0x00000100)
@@ -101,6 +101,12 @@ class ActiveDirectorySecurity(SecurityDescriptorParser):
                 # Rule 2 (MS-CRTD): ACCESS_ALLOWED_ACE with control access bit set
                 if mask & ActiveDirectoryRights.EXTENDED_RIGHT:
                     self.aces[sid]["has_standard_control_access"] = True
+
+            # Process standard access denied ACE
+            elif ace["AceType"] == ldaptypes.ACCESS_DENIED_ACE.ACE_TYPE:
+                self.aces[sid]["denied_rights"] |= self.RIGHTS_TYPE(
+                    ace["Ace"]["Mask"]["Mask"]
+                )
 
             # Process object-specific ACE (for extended rights)
             elif ace["AceType"] == ldaptypes.ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE and ace[
@@ -123,6 +129,19 @@ class ActiveDirectorySecurity(SecurityDescriptorParser):
                     uuid = EXTENDED_RIGHTS_NAME_MAP["All-Extended-Rights"]
 
                 self.aces[sid]["extended_rights"].append(uuid)
+
+        # Net each SID's own deny against its allow (deny wins). The raw denied
+        # mask stays on the entry so callers can also apply deny across a user's
+        # group SIDs, the way the Windows token-wide access check does.
+        for entry in self.aces.values():
+            if entry["denied_rights"]:
+                entry["rights"] = self.RIGHTS_TYPE(
+                    int(entry["rights"]) & ~int(entry["denied_rights"])
+                )
+                # Re-derive the control-access flag from the effective rights
+                entry["has_standard_control_access"] = bool(
+                    entry["rights"] & ActiveDirectoryRights.EXTENDED_RIGHT
+                )
 
     def to_bytes(self) -> bytes:
         """
@@ -165,6 +184,8 @@ class CASecurity(SecurityDescriptorParser):
             if sid not in self.aces:
                 self.aces[sid] = {
                     "rights": self.RIGHTS_TYPE(0),
+                    # Denied rights are kept per SID so deny can also be applied
+                    "denied_rights": self.RIGHTS_TYPE(0),
                     "extended_rights": [],  # CAs don't use extended rights, but keeping for consistency
                     "inherited": bool(ace["AceFlags"] & INHERITED_ACE),
                 }
@@ -172,6 +193,19 @@ class CASecurity(SecurityDescriptorParser):
             if ace["AceType"] == ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE:
                 mask = self.RIGHTS_TYPE(ace["Ace"]["Mask"]["Mask"])
                 self.aces[sid]["rights"] |= mask
+            elif ace["AceType"] == ldaptypes.ACCESS_DENIED_ACE.ACE_TYPE:
+                self.aces[sid]["denied_rights"] |= self.RIGHTS_TYPE(
+                    ace["Ace"]["Mask"]["Mask"]
+                )
+
+        # Net each SID's own deny against its allow (deny wins). The raw denied
+        # mask stays on the entry so callers can also apply deny across a user's
+        # group SIDs, the way the Windows token-wide access check does.
+        for entry in self.aces.values():
+            if entry["denied_rights"]:
+                entry["rights"] = self.RIGHTS_TYPE(
+                    int(entry["rights"]) & ~int(entry["denied_rights"])
+                )
 
 
 def is_admin_sid(sid: str) -> bool:
